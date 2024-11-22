@@ -8,6 +8,7 @@
 (define-constant ERR-INVALID-PRESCRIPTION-DATA (err u4))
 (define-constant ERR-DUPLICATE-HEALTHCARE-PROVIDER (err u5))
 (define-constant ERR-HEALTHCARE-PROVIDER-NOT-FOUND (err u6))
+(define-constant ERR-PRESCRIPTION-LIST-OVERFLOW (err u7))
 
 ;; Data structures
 (define-map patient-medical-records 
@@ -41,6 +42,10 @@
         prescription-active-status: bool
     }
 )
+
+;; Global variables
+(define-data-var global-prescription-counter uint u0)
+(define-data-var all-prescription-ids (list 100 uint) (list)) ;; Tracks all prescription IDs
 
 ;; Authorization verification
 (define-private (verify-provider-authorization (patient-wallet-address principal) (provider-wallet-address principal))
@@ -80,14 +85,19 @@
         (patient-record (get-patient-medical-record requesting-wallet))
         )
         (match patient-record
-            existing-record (
+            existing-record 
                 (ok (map-set patient-medical-records
                     { patient-wallet-address: requesting-wallet }
                     (merge existing-record
-                        { approved-healthcare-providers: (unwrap! (as-max-len? (append (get approved-healthcare-providers existing-record) provider-wallet-address) u5) ERR-UNAUTHORIZED-ACCESS) }
+                        { approved-healthcare-providers: 
+                            (unwrap! 
+                                (as-max-len? 
+                                    (append (get approved-healthcare-providers existing-record) provider-wallet-address) 
+                                    u5) 
+                                ERR-UNAUTHORIZED-ACCESS) 
+                        }
                     )
                 ))
-            )
             ERR-PATIENT-RECORD-NOT-FOUND
         )
     )
@@ -115,8 +125,6 @@
 )
 
 ;; Prescription management functions
-(define-data-var global-prescription-counter uint u0)
-
 (define-private (generate-prescription-identifier)
     (let ((current-counter (var-get global-prescription-counter)))
         (var-set global-prescription-counter (+ current-counter u1))
@@ -134,22 +142,31 @@
     (let (
         (prescribing-provider tx-sender)
         (prescription-identifier (generate-prescription-identifier))
+    )
+        (begin
+            (asserts! (verify-provider-authorization patient-wallet-address prescribing-provider) ERR-UNAUTHORIZED-ACCESS)
+            (asserts! (< prescription-start-timestamp prescription-end-timestamp) ERR-INVALID-PRESCRIPTION-DATA)
+
+            ;; Add prescription record
+            (map-set prescription-records
+                { prescription-identifier: prescription-identifier }
+                {
+                    patient-wallet-address: patient-wallet-address,
+                    prescribing-provider: prescribing-provider,
+                    prescribed-medication: prescribed-medication,
+                    medication-dosage-instructions: medication-dosage-instructions,
+                    prescription-start-timestamp: prescription-start-timestamp,
+                    prescription-end-timestamp: prescription-end-timestamp,
+                    prescription-active-status: true
+                }
+            )
+
+            ;; Add prescription ID to global list
+            (match (as-max-len? (append (var-get all-prescription-ids) prescription-identifier) u100)
+                success (ok (var-set all-prescription-ids success))
+                ERR-PRESCRIPTION-LIST-OVERFLOW
+            )
         )
-        (asserts! (verify-provider-authorization patient-wallet-address prescribing-provider) ERR-UNAUTHORIZED-ACCESS)
-        (asserts! (< prescription-start-timestamp prescription-end-timestamp) ERR-INVALID-PRESCRIPTION-DATA)
-        
-        (ok (map-set prescription-records
-            { prescription-identifier: prescription-identifier }
-            {
-                patient-wallet-address: patient-wallet-address,
-                prescribing-provider: prescribing-provider,
-                prescribed-medication: prescribed-medication,
-                medication-dosage-instructions: medication-dosage-instructions,
-                prescription-start-timestamp: prescription-start-timestamp,
-                prescription-end-timestamp: prescription-end-timestamp,
-                prescription-active-status: true
-            }
-        ))
     )
 )
 
@@ -161,32 +178,53 @@
     (let (
         (requesting-wallet tx-sender)
         (prescription-record (get-prescription-details prescription-identifier))
-        )
+    )
         (match prescription-record
-            existing-prescription (
-                (asserts! (or
-                    (is-eq requesting-wallet (get prescribing-provider existing-prescription))
-                    (is-eq requesting-wallet (get patient-wallet-address existing-prescription))
-                ) ERR-UNAUTHORIZED-ACCESS)
-                (ok (map-set prescription-records
-                    { prescription-identifier: prescription-identifier }
-                    (merge existing-prescription { prescription-active-status: false })
-                ))
-            )
+            existing-prescription 
+                (begin
+                    (asserts! (or
+                        (is-eq requesting-wallet (get prescribing-provider existing-prescription))
+                        (is-eq requesting-wallet (get patient-wallet-address existing-prescription))
+                    ) ERR-UNAUTHORIZED-ACCESS)
+                    (ok (map-set prescription-records
+                        { prescription-identifier: prescription-identifier }
+                        (merge existing-prescription { prescription-active-status: false })
+                    ))
+                )
             ERR-INVALID-PRESCRIPTION-DATA
         )
     )
 )
 
-;; Utility functions
+;; function to correctly use fold
 (define-read-only (get-patient-active-prescriptions (patient-wallet-address principal))
-    (filter prescription-records
-        (lambda (prescription)
-            (and
+    (ok (fold filter-active-prescription-fold (var-get all-prescription-ids) (list)))
+)
+
+(define-private (filter-active-prescription-fold 
+    (prescription-id uint) 
+    (filtered-list (list 100 uint))
+)
+    (let ((patient-wallet-address tx-sender))
+        (if (is-active-prescription patient-wallet-address prescription-id)
+            (unwrap! (as-max-len? (append filtered-list prescription-id) u100) filtered-list)
+            filtered-list
+        )
+    )
+)
+
+(define-private (is-active-prescription (patient-wallet-address principal) (prescription-identifier uint))
+    (is-active-prescription-for-patient prescription-identifier patient-wallet-address)
+)
+
+(define-private (is-active-prescription-for-patient (prescription-identifier uint) (patient-wallet-address principal))
+    (match (get-prescription-details prescription-identifier)
+        prescription 
+            (and 
                 (is-eq (get patient-wallet-address prescription) patient-wallet-address)
                 (get prescription-active-status prescription)
             )
-        )
+        false
     )
 )
 
