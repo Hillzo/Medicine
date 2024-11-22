@@ -9,6 +9,9 @@
 (define-constant ERR-DUPLICATE-HEALTHCARE-PROVIDER (err u5))
 (define-constant ERR-HEALTHCARE-PROVIDER-NOT-FOUND (err u6))
 (define-constant ERR-PRESCRIPTION-LIST-OVERFLOW (err u7))
+(define-constant ERR-INVALID-INPUT (err u8))
+(define-constant ERR-PROVIDER-ALREADY-AUTHORIZED (err u9))
+(define-constant ERR-MAX-PROVIDERS-REACHED (err u10))
 
 ;; Data structures
 (define-map patient-medical-records 
@@ -45,7 +48,32 @@
 
 ;; Global variables
 (define-data-var global-prescription-counter uint u0)
-(define-data-var all-prescription-ids (list 100 uint) (list)) ;; Tracks all prescription IDs
+(define-data-var all-prescription-ids (list 100 uint) (list))
+
+;; Helper functions for input validation
+(define-private (is-valid-ascii-string (input (string-ascii 256)))
+    (and 
+        (is-eq (len input) (len (concat input "")))
+        (>= (len input) u1)
+        (<= (len input) u256)
+    )
+)
+
+(define-private (is-valid-ascii-string-64 (input (string-ascii 64)))
+    (and 
+        (is-eq (len input) (len (concat input "")))
+        (>= (len input) u1)
+        (<= (len input) u64)
+    )
+)
+
+(define-private (is-valid-ascii-string-32 (input (string-ascii 32)))
+    (and 
+        (is-eq (len input) (len (concat input "")))
+        (>= (len input) u1)
+        (<= (len input) u32)
+    )
+)
 
 ;; Authorization verification
 (define-private (verify-provider-authorization (patient-wallet-address principal) (provider-wallet-address principal))
@@ -60,18 +88,18 @@
 ;; Patient management functions
 (define-public (register-new-patient (comprehensive-medical-history (string-ascii 256)) (genetic-profile-data (string-ascii 256)))
     (let ((requesting-wallet tx-sender))
-        (if (is-some (get-patient-medical-record requesting-wallet))
-            ERR-DUPLICATE-PATIENT-RECORD
-            (ok (map-set patient-medical-records
-                { patient-wallet-address: requesting-wallet }
-                {
-                    comprehensive-medical-history: comprehensive-medical-history,
-                    genetic-profile-data: genetic-profile-data,
-                    current-prescriptions: (list),
-                    approved-healthcare-providers: (list)
-                }
-            ))
-        )
+        (asserts! (is-valid-ascii-string comprehensive-medical-history) ERR-INVALID-INPUT)
+        (asserts! (is-valid-ascii-string genetic-profile-data) ERR-INVALID-INPUT)
+        (asserts! (is-none (get-patient-medical-record requesting-wallet)) ERR-DUPLICATE-PATIENT-RECORD)
+        (ok (map-set patient-medical-records
+            { patient-wallet-address: requesting-wallet }
+            {
+                comprehensive-medical-history: comprehensive-medical-history,
+                genetic-profile-data: genetic-profile-data,
+                current-prescriptions: (list),
+                approved-healthcare-providers: (list)
+            }
+        ))
     )
 )
 
@@ -84,21 +112,21 @@
         (requesting-wallet tx-sender)
         (patient-record (get-patient-medical-record requesting-wallet))
         )
-        (match patient-record
-            existing-record 
-                (ok (map-set patient-medical-records
-                    { patient-wallet-address: requesting-wallet }
-                    (merge existing-record
-                        { approved-healthcare-providers: 
-                            (unwrap! 
-                                (as-max-len? 
-                                    (append (get approved-healthcare-providers existing-record) provider-wallet-address) 
-                                    u5) 
-                                ERR-UNAUTHORIZED-ACCESS) 
-                        }
-                    )
-                ))
-            ERR-PATIENT-RECORD-NOT-FOUND
+        (asserts! (is-some patient-record) ERR-PATIENT-RECORD-NOT-FOUND)
+        (let ((existing-record (unwrap-panic patient-record)))
+            (asserts! (< (len (get approved-healthcare-providers existing-record)) u5) ERR-MAX-PROVIDERS-REACHED)
+            (asserts! (is-none (index-of (get approved-healthcare-providers existing-record) provider-wallet-address)) ERR-PROVIDER-ALREADY-AUTHORIZED)
+            (ok (map-set patient-medical-records
+                { patient-wallet-address: requesting-wallet }
+                (merge existing-record
+                    { approved-healthcare-providers: 
+                        (unwrap! (as-max-len? 
+                            (append (get approved-healthcare-providers existing-record) provider-wallet-address)
+                            u5
+                        ) ERR-MAX-PROVIDERS-REACHED)
+                    }
+                )
+            ))
         )
     )
 )
@@ -106,17 +134,17 @@
 ;; Healthcare provider functions
 (define-public (register-healthcare-provider (medical-specialization (string-ascii 64)) (medical-license-identifier (string-ascii 32)))
     (let ((requesting-wallet tx-sender))
-        (if (is-some (map-get? healthcare-provider-registry { provider-wallet-address: requesting-wallet }))
-            ERR-DUPLICATE-HEALTHCARE-PROVIDER
-            (ok (map-set healthcare-provider-registry
-                { provider-wallet-address: requesting-wallet }
-                {
-                    medical-specialization: medical-specialization,
-                    medical-license-identifier: medical-license-identifier,
-                    provider-active-status: true
-                }
-            ))
-        )
+        (asserts! (is-valid-ascii-string-64 medical-specialization) ERR-INVALID-INPUT)
+        (asserts! (is-valid-ascii-string-32 medical-license-identifier) ERR-INVALID-INPUT)
+        (asserts! (is-none (get-provider-details requesting-wallet)) ERR-DUPLICATE-HEALTHCARE-PROVIDER)
+        (ok (map-set healthcare-provider-registry
+            { provider-wallet-address: requesting-wallet }
+            {
+                medical-specialization: medical-specialization,
+                medical-license-identifier: medical-license-identifier,
+                provider-active-status: true
+            }
+        ))
     )
 )
 
@@ -143,29 +171,29 @@
         (prescribing-provider tx-sender)
         (prescription-identifier (generate-prescription-identifier))
     )
-        (begin
-            (asserts! (verify-provider-authorization patient-wallet-address prescribing-provider) ERR-UNAUTHORIZED-ACCESS)
-            (asserts! (< prescription-start-timestamp prescription-end-timestamp) ERR-INVALID-PRESCRIPTION-DATA)
+        (asserts! (verify-provider-authorization patient-wallet-address prescribing-provider) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (< prescription-start-timestamp prescription-end-timestamp) ERR-INVALID-PRESCRIPTION-DATA)
+        (asserts! (is-valid-ascii-string-64 prescribed-medication) ERR-INVALID-INPUT)
+        (asserts! (is-valid-ascii-string-32 medication-dosage-instructions) ERR-INVALID-INPUT)
 
-            ;; Add prescription record
-            (map-set prescription-records
-                { prescription-identifier: prescription-identifier }
-                {
-                    patient-wallet-address: patient-wallet-address,
-                    prescribing-provider: prescribing-provider,
-                    prescribed-medication: prescribed-medication,
-                    medication-dosage-instructions: medication-dosage-instructions,
-                    prescription-start-timestamp: prescription-start-timestamp,
-                    prescription-end-timestamp: prescription-end-timestamp,
-                    prescription-active-status: true
-                }
-            )
+        ;; Add prescription record
+        (map-set prescription-records
+            { prescription-identifier: prescription-identifier }
+            {
+                patient-wallet-address: patient-wallet-address,
+                prescribing-provider: prescribing-provider,
+                prescribed-medication: prescribed-medication,
+                medication-dosage-instructions: medication-dosage-instructions,
+                prescription-start-timestamp: prescription-start-timestamp,
+                prescription-end-timestamp: prescription-end-timestamp,
+                prescription-active-status: true
+            }
+        )
 
-            ;; Add prescription ID to global list
-            (match (as-max-len? (append (var-get all-prescription-ids) prescription-identifier) u100)
-                success (ok (var-set all-prescription-ids success))
-                ERR-PRESCRIPTION-LIST-OVERFLOW
-            )
+        ;; Add prescription ID to global list
+        (match (as-max-len? (append (var-get all-prescription-ids) prescription-identifier) u100)
+            success (ok (var-set all-prescription-ids success))
+            ERR-PRESCRIPTION-LIST-OVERFLOW
         )
     )
 )
@@ -179,19 +207,16 @@
         (requesting-wallet tx-sender)
         (prescription-record (get-prescription-details prescription-identifier))
     )
-        (match prescription-record
-            existing-prescription 
-                (begin
-                    (asserts! (or
-                        (is-eq requesting-wallet (get prescribing-provider existing-prescription))
-                        (is-eq requesting-wallet (get patient-wallet-address existing-prescription))
-                    ) ERR-UNAUTHORIZED-ACCESS)
-                    (ok (map-set prescription-records
-                        { prescription-identifier: prescription-identifier }
-                        (merge existing-prescription { prescription-active-status: false })
-                    ))
-                )
-            ERR-INVALID-PRESCRIPTION-DATA
+        (asserts! (is-some prescription-record) ERR-INVALID-PRESCRIPTION-DATA)
+        (let ((existing-prescription (unwrap-panic prescription-record)))
+            (asserts! (or
+                (is-eq requesting-wallet (get prescribing-provider existing-prescription))
+                (is-eq requesting-wallet (get patient-wallet-address existing-prescription))
+            ) ERR-UNAUTHORIZED-ACCESS)
+            (ok (map-set prescription-records
+                { prescription-identifier: prescription-identifier }
+                (merge existing-prescription { prescription-active-status: false })
+            ))
         )
     )
 )
